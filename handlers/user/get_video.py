@@ -22,16 +22,8 @@ router = Router()
 AUTO_DELETE_AFTER_HOURS = 24
 AUTO_DELETE_CUTOFF = timedelta(hours=AUTO_DELETE_AFTER_HOURS)
 
-# ---- Anti-forward: copy instead of forward + protect content
-PROTECT_CONTENT = True
-
 
 async def auto_cleanup_old_history(bot, uid: int, history: list) -> list:
-    """
-    Delete any history entry whose `at` is older than AUTO_DELETE_AFTER_HOURS
-    from the user's chat. Returns the kept (fresh) entries.
-    Also updates DB: rewrites views.history to the kept list.
-    """
     if not history:
         return []
 
@@ -127,7 +119,7 @@ async def on_get_video(msg: Message):
             kept_hist = await auto_cleanup_old_history(msg.bot, uid, raw_hist)
             user.setdefault("views", {})["history"] = kept_hist
 
-            # ---------- DAILY LIMIT / FORCE-JOIN ----------
+            # ---------- DAILY LIMIT / force-join ----------
             if not is_admin and DAILY_LIMIT > 0:
                 stats = user.get("stats", {})
                 bonus = get_bonus_limit() if stats.get("bonus_date") == today else 0
@@ -144,7 +136,7 @@ async def on_get_video(msg: Message):
                     if not_joined:
                         await msg.answer(
                             f"📵 <b>আজকের লিমিট শেষ!</b>\n\n"
-                            f"নিচের সব চ্যানেল ও গ্রুপ জয়েন করলে "
+                            f"নিচের সব চ্যানেল/গ্রুপ জয়েন করলে "
                             f"<b>+{get_bonus_limit()} ভিডিও</b> বোনাস পাবেন:",
                             reply_markup=force_join_kb(not_joined),
                         )
@@ -194,20 +186,16 @@ async def on_get_video(msg: Message):
         channel_id = int(video["channel_id"])
         video_msg  = int(video["message_id"])
 
-        # ============================================================
-        #  COPY (not forward) + protect_content=True
-        #  → looks like it came from the bot
-        #  → user cannot forward / save / copy it
-        # ============================================================
+        # ---------- forward (protected) ----------
         try:
-            sent = await msg.bot.copy_message(
+            sent = await msg.bot.forward_message(
                 chat_id=chat,
                 from_chat_id=channel_id,
                 message_id=video_msg,
-                protect_content=PROTECT_CONTENT,
+                protect_content=True,          # <-- cannot be re-forwarded or saved
             )
         except Exception as e:
-            logging.warning(f"copy_message failed: {e}")
+            logging.warning(f"forward failed: {e}")
             if user:
                 users_col.update_one(
                     {"_id": uid},
