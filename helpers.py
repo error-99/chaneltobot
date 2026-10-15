@@ -101,10 +101,14 @@ async def get_not_joined(bot, user_id: int) -> list:
 def force_join_kb(not_joined: list) -> InlineKeyboardMarkup:
     rows = []
 
-    # Real channels (must actually join)
+    # Real channels/groups (must actually join)
     for ch in not_joined:
+        # "type" field in channels.json — "group" or "channel" (default)
+        kind = (ch.get("type") or "channel").lower()
+        icon = "👥" if kind == "group" else "📢"
+        label = "Group" if kind == "group" else "Channel"
         rows.append([InlineKeyboardButton(
-            text=f"📢 Join {ch['name']}",
+            text=f"{icon} Join {label}: {ch['name']}",
             url=ch["url"],
         )])
 
