@@ -18,7 +18,6 @@ from helpers import (
 
 router = Router()
 
-# ---- Auto-cleanup: delete forwarded messages older than this from user chat
 AUTO_DELETE_AFTER_HOURS = 24
 AUTO_DELETE_CUTOFF = timedelta(hours=AUTO_DELETE_AFTER_HOURS)
 
@@ -26,24 +25,19 @@ AUTO_DELETE_CUTOFF = timedelta(hours=AUTO_DELETE_AFTER_HOURS)
 async def auto_cleanup_old_history(bot, uid: int, history: list) -> list:
     if not history:
         return []
-
     cutoff = now_utc() - AUTO_DELETE_CUTOFF
     kept = []
     deleted_any = False
-
     for entry in history:
         if not isinstance(entry, dict):
             kept.append(entry)
             continue
-
         at = entry.get("at")
         if at is not None and at.tzinfo is None:
             at = at.replace(tzinfo=timezone.utc)
-
         if at is None:
             kept.append(entry)
             continue
-
         if at < cutoff:
             smid = entry.get("sent_message_id")
             if smid:
@@ -54,16 +48,11 @@ async def auto_cleanup_old_history(bot, uid: int, history: list) -> list:
                     logging.info(f"auto-cleanup skip {uid}/{smid}: {e}")
         else:
             kept.append(entry)
-
     if deleted_any or len(kept) != len(history):
         try:
-            users_col.update_one(
-                {"_id": uid},
-                {"$set": {"views.history": kept}},
-            )
+            users_col.update_one({"_id": uid}, {"$set": {"views.history": kept}})
         except Exception as e:
             logging.warning(f"auto-cleanup db update failed: {e}")
-
     return kept
 
 
@@ -78,11 +67,9 @@ async def on_get_video(msg: Message):
     if not user and not is_admin:
         await msg.answer("আবার /start দিন")
         return
-
     if user and user.get("blocked"):
         await msg.answer("⛔ ব্লকড")
         return
-
     if user and user.get("processing"):
         await msg.answer("⏳ একটু অপেক্ষা করুন")
         return
@@ -94,7 +81,7 @@ async def on_get_video(msg: Message):
         today = today_str()
 
         if user:
-            # ---------- daily reset ----------
+            # daily reset
             if user.get("date") != today:
                 users_col.update_one(
                     {"_id": uid},
@@ -102,7 +89,7 @@ async def on_get_video(msg: Message):
                 )
                 user.setdefault("stats", {})["today"] = 0
 
-            # ---------- cooldown (admin skips) ----------
+            # cooldown (admin skips)
             if not is_admin and COOLDOWN_SECONDS > 0:
                 last = user.get("last_active")
                 if last:
@@ -114,7 +101,7 @@ async def on_get_video(msg: Message):
                         await msg.answer(f"⏱ {wait}s পর চেষ্টা করুন")
                         return
 
-            # ---------- AUTO-CLEANUP ----------
+            # auto-cleanup
             raw_hist = user.get("views", {}).get("history", []) or []
             kept_hist = await auto_cleanup_old_history(msg.bot, uid, raw_hist)
             user.setdefault("views", {})["history"] = kept_hist
@@ -122,33 +109,33 @@ async def on_get_video(msg: Message):
             # ---------- DAILY LIMIT / force-join ----------
             if not is_admin and DAILY_LIMIT > 0:
                 stats = user.get("stats", {})
-                bonus = get_bonus_limit() if stats.get("bonus_date") == today else 0
+                bonus_claimed = (stats.get("bonus_date") == today)
+                bonus = get_bonus_limit() if bonus_claimed else 0
                 effective_limit = DAILY_LIMIT + bonus
 
                 if stats.get("today", 0) >= effective_limit:
-                    force_channels = get_force_channels()
-
-                    if bonus > 0 or not force_channels:
-                        await msg.answer("📵 আজকের লিমিট শেষ!")
-                        return
-
-                    not_joined = await get_not_joined(msg.bot, uid)
-                    if not_joined:
+                    # Already used today's bonus → hard deny
+                    if bonus_claimed:
                         await msg.answer(
                             f"📵 <b>আজকের লিমিট শেষ!</b>\n\n"
-                            f"নিচের সব চ্যানেল/গ্রুপ জয়েন করলে "
-                            f"<b>+{get_bonus_limit()} ভিডিও</b> বোনাস পাবেন:",
-                            reply_markup=force_join_kb(not_joined),
+                            f"আগামীকাল আবার চেষ্টা করুন।"
                         )
                         return
 
-                    users_col.update_one(
-                        {"_id": uid},
-                        {"$set": {"stats.bonus_date": today}},
+                    # Not claimed yet → ALWAYS show join + share prompt
+                    not_joined = await get_not_joined(msg.bot, uid)
+                    await msg.answer(
+                        f"📵 <b>আজকের লিমিট শেষ!</b>\n\n"
+                        f"🎁 <b>+{get_bonus_limit()} ভিডিও</b> বোনাস পেতে:\n"
+                        f"১️⃣ নিচের সব চ্যানেল/গ্রুপ জয়েন করুন\n"
+                        f"২️⃣ 🚀 <b>Share Bot</b> করে বন্ধুদের পাঠান\n"
+                        f"৩️⃣ ✅ <b>I Joined</b> চাপুন\n\n"
+                        f"তারপরই বোনাস অ্যাক্টিভ হবে!",
+                        reply_markup=force_join_kb(not_joined),
                     )
-                    user.setdefault("stats", {})["bonus_date"] = today
+                    return
 
-        # ---------- exclude list ----------
+        # exclude list
         history_raw = user.get("views", {}).get("history", []) if user else []
         history_ids = [
             h.get("video_id") if isinstance(h, dict) else h
@@ -158,7 +145,7 @@ async def on_get_video(msg: Message):
         deleted = user.get("views", {}).get("deleted_ids", []) if user else []
         exclude = list(set(history_ids + (deleted or [])))
 
-        # ---------- query ----------
+        # query
         query = {
             "_id": {"$ne": COUNTER_ID},
             "message_id": {"$nin": exclude},
@@ -166,7 +153,7 @@ async def on_get_video(msg: Message):
         if CATEGORY:
             query["category"] = CATEGORY
 
-        # ---------- pick ----------
+        # pick
         if MODE == "random":
             docs = list(videos_col.aggregate([
                 {"$match": query},
@@ -186,13 +173,13 @@ async def on_get_video(msg: Message):
         channel_id = int(video["channel_id"])
         video_msg  = int(video["message_id"])
 
-        # ---------- forward (protected) ----------
+        # forward (protected)
         try:
             sent = await msg.bot.forward_message(
                 chat_id=chat,
                 from_chat_id=channel_id,
                 message_id=video_msg,
-                protect_content=True,          # <-- cannot be re-forwarded or saved
+                protect_content=True,
             )
         except Exception as e:
             logging.warning(f"forward failed: {e}")
@@ -207,7 +194,7 @@ async def on_get_video(msg: Message):
             await msg.bot.send_message(chat, "⚠️ এই ভিডিওটি আর নেই।")
             return
 
-        # ---------- update user ----------
+        # update user
         if user and not is_admin:
             users_col.update_one(
                 {"_id": uid},
