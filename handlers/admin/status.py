@@ -3,6 +3,7 @@ from aiogram.filters import Command
 from aiogram.types import (
     Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
+    ForceReply,
 )
 
 from config import ADMIN_ID
@@ -14,8 +15,10 @@ router = Router()
 
 def admin_home_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👥 Recent Users",      callback_data="adm_users:0")],
-        [InlineKeyboardButton(text="🗑 Purge All History", callback_data="adm_purge")],
+        [InlineKeyboardButton(text="👥 Recent Users",         callback_data="adm_users:0")],
+        [InlineKeyboardButton(text="🧹 Clean Blocked Users",  callback_data="adm_clean")],
+        [InlineKeyboardButton(text="📢 Broadcast",            callback_data="adm_broadcast")],
+        [InlineKeyboardButton(text="🗑 Purge All History",    callback_data="adm_purge")],
     ])
 
 
@@ -33,7 +36,6 @@ async def admin_home_text() -> str:
     today_sends = agg[0]["today_sends"] if agg else 0
     all_sends   = agg[0]["all_sends"]   if agg else 0
 
-    # count total forwarded messages across all users
     total_sent_msgs = 0
     for u in users_col.find({"views.history.0": {"$exists": True}},
                             {"views.history": 1}):
@@ -50,7 +52,6 @@ async def admin_home_text() -> str:
     )
 
 
-# ---------- /admin ----------
 @router.message(Command("admin"))
 async def cmd_admin(msg: Message):
     if msg.from_user.id != ADMIN_ID:
@@ -59,7 +60,6 @@ async def cmd_admin(msg: Message):
                      reply_markup=admin_home_kb())
 
 
-# ---------- Reply keyboard: 📊 Status ----------
 @router.message(lambda m: m.text == ADMIN_STATUS_TEXT)
 async def btn_status(msg: Message):
     if msg.from_user.id != ADMIN_ID:
@@ -68,7 +68,6 @@ async def btn_status(msg: Message):
                      reply_markup=admin_home_kb())
 
 
-# ---------- Reply keyboard: 👥 Users ----------
 @router.message(lambda m: m.text == ADMIN_USERS_TEXT)
 async def btn_users(msg: Message):
     if msg.from_user.id != ADMIN_ID:
@@ -77,7 +76,6 @@ async def btn_users(msg: Message):
     await _render_users_page(msg, page=0)
 
 
-# ---------- Callbacks ----------
 @router.callback_query(lambda c: c.data == "adm_home")
 async def adm_home(cb: CallbackQuery):
     if cb.from_user.id != ADMIN_ID:
