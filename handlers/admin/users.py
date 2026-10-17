@@ -14,16 +14,31 @@ from db import users_col
 router = Router()
 
 
+# ---------- Safe helpers ----------
 async def _safe_edit(cb: CallbackQuery, text: str, kb):
-    """edit_text, but ignore the harmless 'message is not modified' error."""
     try:
         await cb.message.edit_text(text, reply_markup=kb)
     except TelegramBadRequest as e:
-        if "message is not modified" in str(e):
-            return  # user tapped the same button twice — ignore
-        raise
+        msg = str(e)
+        if "message is not modified" in msg:
+            return
+        if "query is too old" in msg or "query ID is invalid" in msg:
+            return
+        logging.warning(f"_safe_edit: {e}")
     except Exception as e:
-        logging.warning(f"edit_text failed: {e}")
+        logging.warning(f"_safe_edit: {e}")
+
+
+async def _safe_answer(cb: CallbackQuery, text: str = None, show_alert: bool = False):
+    try:
+        await cb.answer(text, show_alert=show_alert)
+    except TelegramBadRequest as e:
+        msg = str(e)
+        if "query is too old" in msg or "query ID is invalid" in msg:
+            return
+        logging.warning(f"_safe_answer: {e}")
+    except Exception as e:
+        logging.warning(f"_safe_answer: {e}")
 
 
 # ---------- Detail view ----------
@@ -99,7 +114,6 @@ def _users_page_kb(users_list, page: int, pages: int, total: int):
 
 
 async def _render_users_page(msg: Message, page: int = 0):
-    """Entry point from the 👥 Users reply-keyboard button."""
     users_list, page, pages, total = _get_users_page(page)
     kb, text = _users_page_kb(users_list, page, pages, total)
     await msg.answer(text, reply_markup=kb)
@@ -109,20 +123,22 @@ async def _render_users_page(msg: Message, page: int = 0):
 async def adm_users(cb: CallbackQuery):
     if cb.from_user.id != ADMIN_ID:
         return
+    await _safe_answer(cb)
     page = int(cb.data.split(":")[1])
     users_list, page, pages, total = _get_users_page(page)
     kb, text = _users_page_kb(users_list, page, pages, total)
     await _safe_edit(cb, text, kb)
 
 
-# ---------- User detail callback ----------
 @router.callback_query(lambda c: c.data and c.data.startswith("adm_u:"))
 async def adm_user_detail(cb: CallbackQuery):
     if cb.from_user.id != ADMIN_ID:
         return
+    await _safe_answer(cb)
+
     uid = int(cb.data.split(":")[1])
     u = users_col.find_one({"_id": uid})
     if not u:
-        await cb.answer("User not found", show_alert=True)
+        await _safe_answer(cb, "User not found", show_alert=True)
         return
     await _safe_edit(cb, user_detail_text(u), user_detail_kb(u))
