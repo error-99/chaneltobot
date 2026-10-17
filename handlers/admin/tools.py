@@ -21,12 +21,16 @@ router = Router()
 
 PENDING_BROADCAST = {}   # {admin_id: {"from_chat_id":..., "message_id":...}}
 
-# ---- how often to refresh the progress message (seconds) ----
-PROGRESS_REFRESH_EVERY = 1.5
+# ============================================================
+#  PERFORMANCE TUNING
+# ============================================================
+BATCH_SIZE             = 25   # concurrent users per wave (safe < 30/sec Telegram limit)
+PROGRESS_REFRESH_EVERY = 1.5  # seconds between progress-message edits
+INITIAL_GATHER_WAVE    = 25   # first wave size (get instant momentum)
 
 
 # ============================================================
-#  Progress bar helpers
+#  Progress helpers
 # ============================================================
 def make_progress_bar(done: int, total: int, width: int = 20) -> str:
     if total <= 0:
@@ -47,19 +51,11 @@ def fmt_seconds(s: float) -> str:
     return f"{h}h {m}m"
 
 
-async def progress_edit(
-    cb: CallbackQuery,
-    title: str,
-    done: int,
-    total: int,
-    stats_lines: list,
-    started_at: float,
-):
-    """Edit the admin message with a live progress bar."""
+async def progress_edit(cb, title, done, total, stats_lines, started_at):
     pct = (done / total * 100) if total > 0 else 0
     bar = make_progress_bar(done, total)
-
     elapsed = time.time() - started_at
+
     if done > 0 and total > done:
         eta = (elapsed / done) * (total - done)
         eta_str = fmt_seconds(eta)
@@ -80,17 +76,17 @@ async def progress_edit(
         await cb.message.edit_text(text)
     except TelegramBadRequest as e:
         m = str(e)
-        if "message is not modified" in m:
-            return
-        if "query is too old" in m or "query ID is invalid" in m:
+        if "message is not modified" in m or "query is too old" in m or "query ID is invalid" in m:
             return
         logging.warning(f"progress_edit: {e}")
+    except TelegramRetryAfter as e:
+        await asyncio.sleep(e.retry_after + 1)
     except Exception as e:
         logging.warning(f"progress_edit: {e}")
 
 
 # ============================================================
-#  🧹 Clean blocked users
+#  🧹 Clean blocked users — parallel
 # ============================================================
 @router.callback_query(lambda c: c.data == "adm_clean")
 async def adm_clean_confirm(cb: CallbackQuery):
@@ -120,36 +116,34 @@ async def adm_clean_run(cb: CallbackQuery):
 
     started = time.time()
 
-    # snapshot total first
-    total = users_col.count_documents({})
+    # ---- 1. snapshot user IDs (single query, no cursor round-trips) ----
+    all_ids = [u["_id"] for u in users_col.find({}, {"_id": 1})]
+    total = len(all_ids)
     if total == 0:
         await _safe_edit(
-            cb,
-            "🧹 No users in database.",
+            cb, "🧹 No users in database.",
             InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🔙 Home", callback_data="adm_home")]
             ]),
         )
         return
 
-    checked   = 0
-    blocked   = 0
-    deleted   = 0
-    failed    = 0
-    skipped   = 0
+    checked  = 0
+    blocked  = 0
+    deleted  = 0
+    failed   = 0
+    skipped  = 0
     admin_uid = ADMIN_ID
 
-    last_refresh = 0.0
+    sem = asyncio.Semaphore(BATCH_SIZE)
 
-    cursor = users_col.find({}, {"_id": 1})
-
-    for u in cursor:
-        uid = u["_id"]
+    async def check_one(uid):
+        nonlocal checked, blocked, deleted, failed, skipped
         if uid == admin_uid:
             skipped += 1
             checked += 1
-        else:
-            checked += 1
+            return
+        async with sem:
             try:
                 await cb.bot.send_chat_action(uid, "typing")
             except TelegramForbiddenError:
@@ -157,9 +151,8 @@ async def adm_clean_run(cb: CallbackQuery):
                 try:
                     users_col.delete_one({"_id": uid})
                     deleted += 1
-                except Exception as e:
+                except Exception:
                     failed += 1
-                    logging.warning(f"clean delete {uid}: {e}")
             except TelegramRetryAfter as e:
                 await asyncio.sleep(e.retry_after + 1)
                 try:
@@ -173,21 +166,25 @@ async def adm_clean_run(cb: CallbackQuery):
                         failed += 1
                 except Exception:
                     failed += 1
-            except Exception as e:
-                logging.warning(f"clean check {uid}: {e}")
+            except Exception:
                 failed += 1
+            checked += 1
 
-            await asyncio.sleep(0.05)   # ~20/sec
+    # ---- 2. process in parallel waves ----
+    last_refresh = 0.0
+    i = 0
+    while i < total:
+        batch = all_ids[i:i + BATCH_SIZE]
+        await asyncio.gather(*(check_one(uid) for uid in batch))
+        i += BATCH_SIZE
 
-        # ---- refresh progress bar ----
         now = time.time()
-        if now - last_refresh >= PROGRESS_REFRESH_EVERY or checked == total:
+        if now - last_refresh >= PROGRESS_REFRESH_EVERY or i >= total:
             last_refresh = now
             await progress_edit(
                 cb,
                 "🧹 <b>Cleaning blocked users…</b>",
-                checked,
-                total,
+                checked, total,
                 [
                     f"🚫 Blocked detected: <b>{blocked}</b>",
                     f"🗑 Deleted from DB: <b>{deleted}</b>",
@@ -197,7 +194,6 @@ async def adm_clean_run(cb: CallbackQuery):
                 started,
             )
 
-    # final
     await _safe_edit(
         cb,
         f"🧹 <b>Clean Complete</b>\n\n"
@@ -214,7 +210,7 @@ async def adm_clean_run(cb: CallbackQuery):
 
 
 # ============================================================
-#  📢 Broadcast
+#  📢 Broadcast — parallel
 # ============================================================
 @router.callback_query(lambda c: c.data == "adm_broadcast")
 async def adm_broadcast_start(cb: CallbackQuery):
@@ -290,11 +286,17 @@ async def adm_broadcast_go(cb: CallbackQuery):
     await _safe_answer(cb, "Broadcasting…")
     started = time.time()
 
-    total = users_col.count_documents({"_id": {"$ne": ADMIN_ID}})
+    # ---- snapshot IDs, exclude admin ----
+    all_ids = [
+        u["_id"] for u in users_col.find(
+            {"_id": {"$ne": ADMIN_ID}},
+            {"_id": 1},
+        )
+    ]
+    total = len(all_ids)
     if total == 0:
         await _safe_edit(
-            cb,
-            "📢 No users to broadcast to.",
+            cb, "📢 No users to broadcast to.",
             InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🔙 Home", callback_data="adm_home")]
             ]),
@@ -307,24 +309,12 @@ async def adm_broadcast_go(cb: CallbackQuery):
     deleted = 0
     done    = 0
 
-    last_refresh = 0.0
+    sem = asyncio.Semaphore(BATCH_SIZE)
+    blocked_uids = []   # batch-delete at the end
 
-    cursor = users_col.find({}, {"_id": 1})
-    for u in cursor:
-        uid = u["_id"]
-        if uid == ADMIN_ID:
-            continue
-
-        try:
-            await cb.bot.copy_message(
-                chat_id=uid,
-                from_chat_id=pending["from_chat_id"],
-                message_id=pending["message_id"],
-                protect_content=True,
-            )
-            sent += 1
-        except TelegramRetryAfter as e:
-            await asyncio.sleep(e.retry_after + 1)
+    async def send_one(uid):
+        nonlocal sent, failed, blocked, done
+        async with sem:
             try:
                 await cb.bot.copy_message(
                     chat_id=uid,
@@ -333,38 +323,53 @@ async def adm_broadcast_go(cb: CallbackQuery):
                     protect_content=True,
                 )
                 sent += 1
+            except TelegramRetryAfter as e:
+                await asyncio.sleep(e.retry_after + 1)
+                try:
+                    await cb.bot.copy_message(
+                        chat_id=uid,
+                        from_chat_id=pending["from_chat_id"],
+                        message_id=pending["message_id"],
+                        protect_content=True,
+                    )
+                    sent += 1
+                except TelegramForbiddenError:
+                    blocked += 1
+                    blocked_uids.append(uid)
+                except Exception:
+                    failed += 1
             except TelegramForbiddenError:
                 blocked += 1
-                try:
-                    users_col.delete_one({"_id": uid})
-                    deleted += 1
-                except Exception:
-                    pass
-            except Exception:
+                blocked_uids.append(uid)
+            except Exception as e:
+                logging.warning(f"broadcast {uid}: {e}")
                 failed += 1
-        except TelegramForbiddenError:
-            blocked += 1
+            done += 1
+
+    # ---- process in parallel waves ----
+    last_refresh = 0.0
+    i = 0
+    while i < total:
+        batch = all_ids[i:i + BATCH_SIZE]
+        await asyncio.gather(*(send_one(uid) for uid in batch))
+        i += BATCH_SIZE
+
+        # batch-delete blocked uids after each wave
+        if blocked_uids:
             try:
-                users_col.delete_one({"_id": uid})
-                deleted += 1
-            except Exception:
-                pass
-        except Exception as e:
-            logging.warning(f"broadcast send {uid}: {e}")
-            failed += 1
+                users_col.delete_many({"_id": {"$in": blocked_uids}})
+                deleted += len(blocked_uids)
+            except Exception as e:
+                logging.warning(f"bulk delete blocked: {e}")
+            blocked_uids.clear()
 
-        done += 1
-        await asyncio.sleep(0.04)   # ~25/sec
-
-        # ---- refresh progress bar ----
         now = time.time()
-        if now - last_refresh >= PROGRESS_REFRESH_EVERY or done == total:
+        if now - last_refresh >= PROGRESS_REFRESH_EVERY or i >= total:
             last_refresh = now
             await progress_edit(
                 cb,
                 "📢 <b>Broadcasting…</b>",
-                done,
-                total,
+                done, total,
                 [
                     f"✅ Sent: <b>{sent}</b>",
                     f"🚫 Blocked: <b>{blocked}</b>",
@@ -373,6 +378,14 @@ async def adm_broadcast_go(cb: CallbackQuery):
                 ],
                 started,
             )
+
+    # final cleanup of any remaining blocked uids
+    if blocked_uids:
+        try:
+            users_col.delete_many({"_id": {"$in": blocked_uids}})
+            deleted += len(blocked_uids)
+        except Exception:
+            pass
 
     await _safe_edit(
         cb,
